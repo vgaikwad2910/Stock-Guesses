@@ -1,0 +1,127 @@
+
+!pip uninstall -y numpy pandas
+!pip install "numpy<2.0.0"
+!pip install pandas==2.2.2
+!pip install yfinance pandas-ta prophet tensorflow scikit-learn
+
+import yfinance as yf
+import pandas_ta as ta
+import pandas as pd
+import numpy as np
+
+df_raw = yf.download("GOOGL", period="5y")
+if isinstance(df_raw.columns, pd.MultiIndex):
+    df_raw.columns = df_raw.columns.get_level_values(0)
+
+def add_indicators(data):
+    df_t = data.copy()
+    df_t['SMA_20'] = ta.sma(df_t['Close'], length=20)
+    df_t['SMA_50'] = ta.sma(df_t['Close'], length=50)
+    df_t['RSI'] = ta.rsi(df_t['Close'], length=30)
+    return pd.concat([df_t, ta.macd(df_t['Close'])], axis=1).dropna()
+
+df = add_indicators(df_raw[['Close']])
+
+
+from sklearn.preprocessing import MinMaxScaler
+
+scaler = MinMaxScaler()
+scaled_data = scaler.fit_transform(df)
+
+X, y = [], []
+for i in range(60, len(scaled_data)):
+    X.append(scaled_data[i-60:i, :])
+    y.append(scaled_data[i, 0])
+X, y = np.array(X), np.array(y)
+
+# We split by time (No shuffling!) to avoid data leakage
+X_train, X_test = X[:-45], X[-45:]
+y_train, y_test = y[:-45], y[-45:]
+
+from prophet import Prophet
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+
+# Model A: Prophet (Statistical)
+ph_df = df[['Close']][:-45].reset_index().rename(columns={'Date': 'ds', 'Close': 'y'})
+ph_df['ds'] = ph_df['ds'].dt.tz_localize(None)
+model_ph = Prophet(interval_width=0.95, daily_seasonality=True).fit(ph_df)
+
+# Model B: LSTM (Neural)
+model_lstm = Sequential([
+    LSTM(64, return_sequences=True, input_shape=(60, len(df.columns))),
+    Dropout(0.2), 
+    LSTM(32),
+    Dropout(0.2),
+    Dense(1)
+])
+model_lstm.compile(optimizer='adam', loss='mse')
+model_lstm.fit(X_train, y_train, epochs=25, batch_size=32, verbose=0)
+
+from sklearn.metrics import mean_absolute_percentage_error as mape
+
+# 1. Backtest Results (for MAPE)
+l_preds_scaled = model_lstm.predict(X_test, verbose=0)
+l_preds = scaler.inverse_transform(np.hstack([l_preds_scaled, np.zeros((45, len(df.columns)-1))]))[:,0]
+p_preds = model_ph.predict(model_ph.make_future_dataframe(periods=45)).iloc[-45:]['yhat']
+
+l_mape = mape(df['Close'][-45:], l_preds) * 100
+p_mape = mape(df['Close'][-45:], p_preds) * 100
+
+# 2. "Tomorrow" Predictions (One-Step Ahead)
+# We take the most recent 60 days of REAL data
+last_60_real = scaled_data[-60:].reshape(1, 60, -1)
+tomorrow_lstm_scaled = model_lstm.predict(last_60_real, verbose=0)
+tomorrow_lstm = scaler.inverse_transform(np.hstack([tomorrow_lstm_scaled, np.zeros((1, len(df.columns)-1))]))[0,0]
+
+tomorrow_ph = model_ph.predict(model_ph.make_future_dataframe(periods=46)).iloc[-1]['yhat']
+
+import matplotlib.pyplot as plt
+from datetime import timedelta
+
+# --- Visual Settings ---
+plt.style.use('seaborn-v0_8-whitegrid') # Professional clean look
+fig, ax = plt.subplots(figsize=(16, 8), facecolor='#f8f9fa')
+tomorrow_date = df.index[-1] + timedelta(days=1)
+
+# 1. Plot Historical Data (Last 45 Days for context)
+hist_slice = df['Close'][-45:]
+ax.plot(hist_slice.index, hist_slice.values, label="Actual History", color='#2c3e50', lw=2.5, alpha=0.8)
+
+# 2. Add Data Labels to Historical Peaks
+# We label local maximums so the chart looks "analyzed"
+peaks = hist_slice[(hist_slice > hist_slice.shift(1)) & (hist_slice > hist_slice.shift(-1))]
+for date, val in peaks.tail(3).items(): # Label the last 3 peaks
+    ax.text(date, val + 2, f'${val:.2f}', ha='center', fontsize=9, fontweight='bold', color='#5d6d7e')
+
+# 3. Plot Tomorrow's Targets
+ax.scatter(tomorrow_date, tomorrow_lstm, color='#e74c3c', s=150, edgecolors='black', zorder=5, label='LSTM Prediction')
+ax.scatter(tomorrow_date, tomorrow_ph, color='#3498db', s=150, edgecolors='black', zorder=5, label='Prophet Prediction')
+
+# 4. HIGH-VISIBILITY LABELS (Boxed and Offset)
+# LSTM Label (Positioned Above)
+ax.annotate(f'LSTM G Price: ${tomorrow_lstm:.2f}\nMAPE: {l_mape:.2f}%',
+            xy=(tomorrow_date, tomorrow_lstm), xytext=(20, 40),
+            textcoords='offset points', fontsize=11, fontweight='bold',
+            color='white', bbox=dict(boxstyle='round,pad=0.5', fc='#e74c3c', ec='black', alpha=0.9),
+            arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0.3', color='#e74c3c'))
+
+# Prophet Label (Positioned Below)
+ax.annotate(f'PROPHET G Price: ${tomorrow_ph:.2f}\nMAPE: {p_mape:.2f}%',
+            xy=(tomorrow_date, tomorrow_ph), xytext=(20, -60),
+            textcoords='offset points', fontsize=11, fontweight='bold',
+            color='white', bbox=dict(boxstyle='round,pad=0.5', fc='#3498db', ec='black', alpha=0.9),
+            arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=-0.3', color='#3498db'))
+
+# 5. Clean up Axes and Title
+ax.set_title(f"Google ($GOOGL$) Price Prediction • {tomorrow_date.date()}", fontsize=18, pad=20, fontweight='bold')
+ax.set_ylabel("Price (USD)", fontsize=12, fontweight='bold')
+ax.axvline(x=df.index[-1], color='black', linestyle=':', alpha=0.4) # "Today" line
+
+# Expand X-axis to make room for labels on the right
+ax.set_xlim(hist_slice.index[0], tomorrow_date + timedelta(days=5)) 
+
+plt.legend(loc='upper left', frameon=True, shadow=True)
+plt.tight_layout()
+plt.show()
+
